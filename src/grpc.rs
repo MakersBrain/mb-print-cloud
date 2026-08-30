@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use crate::{api::AppState, db::now};
+use crate::{
+    api::AppState,
+    db::now,
+    observability::{JobCounts, JobEvent, duration_ms, job_event},
+};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -151,7 +155,11 @@ async fn session_loop(
                     && let Ok(rows)=sqlx::query_as::<_,(String,String,Vec<u8>,Vec<u8>)>("SELECT id,printer_id,request,payload_digest FROM print_jobs WHERE agent_id=? AND state IN ('queued','delivered','running') AND cancellation_requested_at IS NULL AND request IS NOT NULL ORDER BY created_at LIMIT 32").bind(agent.to_string()).fetch_all(&state.pool).await
                     && let Some((id,printer,request,digest))=rows.into_iter().find(|row|!offered.contains(&row.0)) {
                         let message=BrokerMessage{payload:Some(broker_message::Payload::PrintJob(wire::PrintJob{job_id:id.clone(),printer_id:printer,request_json:request,sha256:hex(&digest)}))};
-                        if sender.send(Ok(message)).await.is_err(){break} offered.insert(id.clone()); outstanding=Some(id);
+                        if sender.send(Ok(message)).await.is_err(){break}
+                        if let Ok(job_id) = Uuid::parse_str(&id) {
+                            job_event(job_id, JobEvent::Offered, "queued", None, None, JobCounts::default());
+                        }
+                        offered.insert(id.clone()); outstanding=Some(id);
                 }
                 if let Ok(ids)=sqlx::query_scalar::<_,String>("SELECT id FROM print_jobs WHERE agent_id=? AND state IN ('delivered','running') AND cancellation_requested_at IS NOT NULL").bind(agent.to_string()).fetch_all(&state.pool).await {
                     for id in ids { if cancellations.insert(id.clone()) && sender.send(Ok(BrokerMessage{payload:Some(broker_message::Payload::CancelJob(wire::CancelJob{job_id:id}))})).await.is_err(){break} }
@@ -202,7 +210,19 @@ async fn handle_agent(
                 return Err(Status::invalid_argument("job digest mismatch"));
             }
             if row.1 == "queued" {
-                sqlx::query("UPDATE print_jobs SET state='delivered',delivered_at=? WHERE id=? AND agent_id=? AND state='queued'").bind(now()).bind(&r.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?;
+                let changed = sqlx::query("UPDATE print_jobs SET state='delivered',delivered_at=? WHERE id=? AND agent_id=? AND state='queued'").bind(now()).bind(&r.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?.rows_affected();
+                if changed == 1
+                    && let Ok(job_id) = Uuid::parse_str(&r.job_id)
+                {
+                    job_event(
+                        job_id,
+                        JobEvent::Delivered,
+                        "delivered",
+                        None,
+                        None,
+                        JobCounts::default(),
+                    );
+                }
             }
             if outstanding.as_deref() == Some(&r.job_id) {
                 *outstanding = None;
@@ -253,15 +273,49 @@ async fn update_job(
     } else {
         "running"
     };
-    sqlx::query("UPDATE print_jobs SET state=?,terminal_outcome=CASE WHEN ? THEN ? ELSE terminal_outcome END,action=?,last_completed_action=MAX(last_completed_action,?),action_count=MAX(action_count,?),bytes_sent=MAX(bytes_sent,?),total_bytes=MAX(total_bytes,?),write_may_have_occurred=(write_may_have_occurred OR ?),error_code=NULLIF(?,''),started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,?) ELSE terminal_at END WHERE id=? AND agent_id=? AND terminal_at IS NULL")
-        .bind(cloud_state).bind(terminal).bind(if terminal{Some(job.state.as_str())}else{None}).bind(&job.state).bind(job.last_completed_action).bind(job.action_count as i64).bind(job.bytes_sent as i64).bind(job.total_bytes as i64).bind(job.potentially_accepted_write).bind(&job.error_code).bind(cloud_state).bind(now()).bind(terminal).bind(now()).bind(&job.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?;
+    let updated_at = now();
+    let changed = sqlx::query("UPDATE print_jobs SET state=?,terminal_outcome=CASE WHEN ? THEN ? ELSE terminal_outcome END,action=?,last_completed_action=MAX(last_completed_action,?),action_count=MAX(action_count,?),bytes_sent=MAX(bytes_sent,?),total_bytes=MAX(total_bytes,?),write_may_have_occurred=(write_may_have_occurred OR ?),error_code=NULLIF(?,''),started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,?) ELSE terminal_at END WHERE id=? AND agent_id=? AND terminal_at IS NULL")
+        .bind(cloud_state).bind(terminal).bind(if terminal{Some(job.state.as_str())}else{None}).bind(&job.state).bind(job.last_completed_action).bind(job.action_count as i64).bind(job.bytes_sent as i64).bind(job.total_bytes as i64).bind(job.potentially_accepted_write).bind(&job.error_code).bind(cloud_state).bind(updated_at).bind(terminal).bind(updated_at).bind(&job.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?.rows_affected();
+    if changed == 1
+        && let Ok(job_id) = Uuid::parse_str(&job.job_id)
+    {
+        let elapsed = if terminal {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT created_at FROM print_jobs WHERE id=? AND agent_id=?",
+            )
+            .bind(&job.job_id)
+            .bind(agent.to_string())
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?
+            .map(|created_at| duration_ms(created_at, updated_at))
+        } else {
+            None
+        };
+        job_event(
+            job_id,
+            if terminal {
+                JobEvent::Terminal
+            } else {
+                JobEvent::Progress
+            },
+            cloud_state,
+            terminal.then_some(job.state.as_str()),
+            elapsed,
+            JobCounts {
+                action_count: job.action_count,
+                bytes_sent: job.bytes_sent,
+                total_bytes: job.total_bytes,
+            },
+        );
+    }
     Ok(())
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn internal(e: sqlx::Error) -> Status {
-    tracing::error!(error_class=%e,"broker database failure");
+fn internal(_error: sqlx::Error) -> Status {
+    tracing::error!(error_code = "database");
     Status::internal("broker failure")
 }
 

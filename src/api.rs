@@ -2,6 +2,7 @@
 use crate::{
     config::{Config, Credential},
     db::now,
+    observability::{JobCounts, JobEvent, duration_ms, job_event},
 };
 use axum::{
     Json, Router,
@@ -140,8 +141,8 @@ impl IntoResponse for ApiError {
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", Some(m)),
             Self::Gone => (StatusCode::GONE, "expired_or_consumed", None),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited", None),
-            Self::Internal(e) => {
-                tracing::error!(error_class=%e.root_cause(),"request failed");
+            Self::Internal(_error) => {
+                tracing::error!(error_code = "internal");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
             }
         };
@@ -562,7 +563,11 @@ async fn create_job(
     let mut tx = s.pool.begin().await?;
     if let Some((existing_id,existing_digest))=sqlx::query_as::<_,(String,Vec<u8>)>("SELECT id,request_digest FROM print_jobs WHERE tenant_id=? AND submitted_by=? AND idempotency_key=?").bind(tenant.to_string()).bind(&subject).bind(key).fetch_optional(&mut *tx).await? {
         if existing_digest!=semantic{return Err(ApiError::Conflict("Idempotency-Key was reused with another request"))}
-        let row=sqlx::query_as::<_,JobView>(JOB_BY_ID).bind(existing_id).bind(tenant.to_string()).fetch_one(&mut *tx).await?; tx.commit().await?; return Ok((StatusCode::ACCEPTED,Json(row)));
+        let row=sqlx::query_as::<_,JobView>(JOB_BY_ID).bind(existing_id).bind(tenant.to_string()).fetch_one(&mut *tx).await?; tx.commit().await?;
+        if let Ok(job_id) = Uuid::parse_str(&row.id) {
+            job_event(job_id, JobEvent::Replayed, &row.state, row.terminal_outcome.as_deref(), row.terminal_at.map(|at| duration_ms(row.created_at, at)), JobCounts { action_count: row.action_count.max(0) as u64, bytes_sent: row.bytes_sent.max(0) as u64, total_bytes: row.total_bytes.max(0) as u64 });
+        }
+        return Ok((StatusCode::ACCEPTED,Json(row)));
     }
     let printer = sqlx::query_as::<_, (String, bool, String)>(
         "SELECT agent_id,enabled,model FROM printers WHERE id=? AND tenant_id=?",
@@ -588,6 +593,14 @@ async fn create_job(
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
+    job_event(
+        id,
+        JobEvent::Submitted,
+        "queued",
+        None,
+        None,
+        JobCounts::default(),
+    );
     Ok((StatusCode::ACCEPTED, Json(row)))
 }
 #[utoipa::path(
@@ -636,7 +649,21 @@ async fn cancel_job(
     if changed != 1 {
         return Err(ApiError::Conflict("job is already terminal or unknown"));
     }
-    get_job(State(s), Path((tenant, job)), headers).await
+    let response = get_job(State(s), Path((tenant, job)), headers).await?;
+    let row = &response.0;
+    job_event(
+        job,
+        JobEvent::CancellationRequested,
+        &row.state,
+        row.terminal_outcome.as_deref(),
+        row.terminal_at.map(|at| duration_ms(row.created_at, at)),
+        JobCounts {
+            action_count: row.action_count.max(0) as u64,
+            bytes_sent: row.bytes_sent.max(0) as u64,
+            total_bytes: row.total_bytes.max(0) as u64,
+        },
+    );
+    Ok(response)
 }
 
 #[cfg(test)]

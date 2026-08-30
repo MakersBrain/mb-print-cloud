@@ -3,6 +3,7 @@ mod api;
 mod config;
 mod db;
 mod grpc;
+mod observability;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
@@ -82,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
                     ),
                 )
                 .serve(config.grpc_listen);
-            tracing::info!(api=%config.api_listen,grpc=%config.grpc_listen,"mb-print-cloud ready");
+            tracing::info!(state = "ready");
             tokio::select! { result=api=>result?, result=grpc=>result?, _=tokio::signal::ctrl_c()=>{} }
         }
         Command::Openapi => {
