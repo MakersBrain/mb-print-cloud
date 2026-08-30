@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+package makersbrain.print.agent.v1;
+service PrinterAgentService { rpc Session(stream AgentMessage) returns (stream BrokerMessage); }
+message AgentMessage { oneof payload { AgentHello hello=1; Heartbeat heartbeat=2; PrinterStatus printer_status=3; JobReceived job_received=4; JobProgress job_progress=5; JobResult job_result=6; } }
+message BrokerMessage { oneof payload { BrokerHello hello=1; PrintJob print_job=2; CancelJob cancel_job=3; } }
+message AgentHello { string agent_id=1; uint32 protocol_version=2; string software_version=3; repeated PublishedPrinter printers=4; repeated JobStatus jobs=5; }
+message BrokerHello { uint32 protocol_version=1; uint32 heartbeat_seconds=2; uint64 max_request_bytes=3; }
+message PublishedPrinter { string printer_id=1; string name=2; string model=3; bool enabled=4; }
+message Heartbeat { repeated JobStatus jobs=1; }
+message PrinterStatus { string printer_id=1; string status=2; }
+message PrintJob { string job_id=1; string printer_id=2; bytes request_json=3; string sha256=4; }
+message CancelJob { string job_id=1; }
+message JobReceived { string job_id=1; string sha256=2; }
+message JobProgress { JobStatus job=1; }
+message JobResult { JobStatus job=1; }
+message JobStatus { string job_id=1; string state=2; bool terminal=3; int64 last_completed_action=4; uint64 bytes_sent=5; uint64 total_bytes=6; bool potentially_accepted_write=7; string error_code=8; }
