@@ -27,6 +27,7 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    Openapi,
 }
 
 #[tokio::main]
@@ -83,6 +84,12 @@ async fn main() -> anyhow::Result<()> {
                 .serve(config.grpc_listen);
             tracing::info!(api=%config.api_listen,grpc=%config.grpc_listen,"mb-print-cloud ready");
             tokio::select! { result=api=>result?, result=grpc=>result?, _=tokio::signal::ctrl_c()=>{} }
+        }
+        Command::Openapi => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&api::openapi_document())?
+            );
         }
     }
     Ok(())

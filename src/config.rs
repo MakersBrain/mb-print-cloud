@@ -17,6 +17,8 @@ pub struct Config {
     pub database_path: PathBuf,
     pub tenant: Tenant,
     pub credentials: Vec<Credential>,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
     #[serde(default = "default_limit")]
     pub max_request_bytes: usize,
 }
@@ -57,6 +59,7 @@ impl Config {
                 token_sha256: token_hash,
                 permissions: vec!["print".into(), "manage-printers".into()],
             }],
+            cors_origins: Vec::new(),
             max_request_bytes: default_limit(),
         }
     }
@@ -93,6 +96,17 @@ fn validate(config: &Config) -> anyhow::Result<()> {
     }
     if config.credentials.is_empty() {
         anyhow::bail!("at least one API credential is required");
+    }
+    for origin in &config.cors_origins {
+        let url = url::Url::parse(origin)?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            anyhow::bail!("cors_origins entries must be exact HTTP(S) origins");
+        }
     }
     for credential in &config.credentials {
         if credential.subject.trim().is_empty()

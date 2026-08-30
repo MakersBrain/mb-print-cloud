@@ -34,6 +34,24 @@ agent.print.example.com {
 Set `public_api_url` and `public_agent_url` to those HTTPS origins. Keep the
 gRPC proxy idle timeout longer than the 15-second heartbeat interval.
 
+For direct use by the standalone label-editor PWA, add its exact HTTPS origin
+to the owner-only TOML config. Wildcards are not accepted:
+
+```toml
+cors_origins = ["https://labels.example.com"]
+```
+
+The browser may then call the JSON endpoint with `Authorization`,
+`Content-Type`, and `Idempotency-Key`. Keep the API token limited to the
+`print` permission when the browser does not need enrollment or revocation.
+The PWA keeps this token only for the current page session.
+
+Export the generated OpenAPI 3.1 contract without starting a listener:
+
+```sh
+mb-print-cloud openapi > mb-print-cloud.openapi.json
+```
+
 ## Enrollment
 
 Call `POST /v1/tenants/{tenant}/printer-enrollments` with the management bearer

@@ -253,8 +253,8 @@ async fn update_job(
     } else {
         "running"
     };
-    sqlx::query("UPDATE print_jobs SET state=?,terminal_outcome=CASE WHEN ? THEN ? ELSE terminal_outcome END,action=?,bytes_sent=MAX(bytes_sent,?),total_bytes=MAX(total_bytes,?),write_may_have_occurred=(write_may_have_occurred OR ?),error_code=NULLIF(?,''),started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,?) ELSE terminal_at END WHERE id=? AND agent_id=? AND terminal_at IS NULL")
-        .bind(cloud_state).bind(terminal).bind(if terminal{Some(job.state.as_str())}else{None}).bind(&job.state).bind(job.bytes_sent as i64).bind(job.total_bytes as i64).bind(job.potentially_accepted_write).bind(&job.error_code).bind(cloud_state).bind(now()).bind(terminal).bind(now()).bind(&job.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?;
+    sqlx::query("UPDATE print_jobs SET state=?,terminal_outcome=CASE WHEN ? THEN ? ELSE terminal_outcome END,action=?,last_completed_action=MAX(last_completed_action,?),action_count=MAX(action_count,?),bytes_sent=MAX(bytes_sent,?),total_bytes=MAX(total_bytes,?),write_may_have_occurred=(write_may_have_occurred OR ?),error_code=NULLIF(?,''),started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,?) ELSE terminal_at END WHERE id=? AND agent_id=? AND terminal_at IS NULL")
+        .bind(cloud_state).bind(terminal).bind(if terminal{Some(job.state.as_str())}else{None}).bind(&job.state).bind(job.last_completed_action).bind(job.action_count as i64).bind(job.bytes_sent as i64).bind(job.total_bytes as i64).bind(job.potentially_accepted_write).bind(&job.error_code).bind(cloud_state).bind(now()).bind(terminal).bind(now()).bind(&job.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?;
     Ok(())
 }
 fn hex(bytes: &[u8]) -> String {
@@ -267,6 +267,7 @@ fn internal(e: sqlx::Error) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[test]
     fn protobuf_contract_matches_the_agent_checkout_when_present() {
         let local = include_str!("../proto/makersbrain/print/agent/v1/agent.proto");
@@ -279,5 +280,44 @@ mod tests {
                 normalize(&std::fs::read_to_string(agent).unwrap())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn agent_progress_keeps_action_boundary_fields_for_the_json_api() {
+        let directory = tempfile::tempdir().unwrap();
+        let config =
+            crate::config::Config::template(directory.path().join("cloud.sqlite3"), "a".repeat(64));
+        let pool = crate::db::open(&config.database_path).await.unwrap();
+        let tenant = config.tenant.id.to_string();
+        let agent = Uuid::new_v4();
+        let printer = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO printer_agents(id,tenant_id,display_name,state,created_by,created_at) VALUES(?,?,?,'active','test',?)").bind(agent.to_string()).bind(&tenant).bind("agent").bind(now()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO printers(id,tenant_id,agent_id,display_name,model,enabled,online,created_at,updated_at) VALUES(?,?,?,?,?,1,1,?,?)").bind(printer.to_string()).bind(&tenant).bind(agent.to_string()).bind("printer").bind("m110").bind(now()).bind(now()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO print_jobs(id,tenant_id,submitted_by,source,agent_id,printer_id,payload_digest,idempotency_key,request_digest,state,created_at,delete_payload_at) VALUES(?,?,?,?,?,?,X'00','key',X'00','delivered',?,?)").bind(job_id.to_string()).bind(&tenant).bind("test").bind("test").bind(agent.to_string()).bind(printer.to_string()).bind(now()).bind(now()+60).execute(&pool).await.unwrap();
+        let state = AppState {
+            pool: pool.clone(),
+            config: std::sync::Arc::new(config),
+        };
+        update_job(
+            &state,
+            agent,
+            &wire::JobStatus {
+                job_id: job_id.to_string(),
+                state: "running".into(),
+                terminal: false,
+                last_completed_action: 7,
+                bytes_sent: 128,
+                total_bytes: 256,
+                potentially_accepted_write: true,
+                error_code: String::new(),
+                action_count: 12,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>("SELECT last_completed_action,action_count,bytes_sent,total_bytes FROM print_jobs WHERE id=?").bind(job_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(row, (7, 12, 128, 256));
     }
 }

@@ -6,9 +6,9 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
@@ -22,6 +22,16 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use utoipa::{
+    Modify, OpenApi, ToSchema,
+    openapi::{
+        RefOr, Schema,
+        schema::{AdditionalProperties, ObjectBuilder, Type},
+        security::{Http, HttpAuthScheme, SecurityScheme},
+    },
+};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -30,26 +40,49 @@ pub struct AppState {
     pub config: Arc<Config>,
 }
 
+fn business_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(exchange))
+        .routes(routes!(create_enrollment))
+        .routes(routes!(list_agents))
+        .routes(routes!(revoke_agent))
+        .routes(routes!(list_printers))
+        .routes(routes!(create_job))
+        .routes(routes!(get_job))
+        .routes(routes!(cancel_job))
+}
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let (business, openapi) = business_router().split_for_parts();
+    let origins = state
+        .config
+        .cors_origins
+        .iter()
+        .map(|origin| {
+            origin
+                .parse::<HeaderValue>()
+                .expect("validated CORS origin")
+        })
+        .collect::<Vec<_>>();
+    let document = Arc::new(openapi);
+    business
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
-        .route("/openapi.json", get(openapi))
-        .route("/v1/printer-enrollments/exchange", post(exchange))
         .route(
-            "/v1/tenants/{tenant}/printer-enrollments",
-            post(create_enrollment),
+            "/openapi.json",
+            get(move || {
+                let document = document.clone();
+                async move { Json((*document).clone()) }
+            }),
         )
-        .route("/v1/tenants/{tenant}/printer-agents", get(list_agents))
-        .route(
-            "/v1/tenants/{tenant}/printer-agents/{agent}/revoke",
-            post(revoke_agent),
-        )
-        .route("/v1/tenants/{tenant}/printers", get(list_printers))
-        .route("/v1/tenants/{tenant}/print-jobs", post(create_job))
-        .route("/v1/tenants/{tenant}/print-jobs/{job}", get(get_job))
-        .route(
-            "/v1/tenants/{tenant}/print-jobs/{job}/cancel",
-            post(cancel_job),
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    header::HeaderName::from_static("idempotency-key"),
+                ]),
         )
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             state.config.max_request_bytes,
@@ -57,22 +90,23 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn openapi() -> Json<Value> {
-    Json(json!({
-        "openapi":"3.1.0",
-        "info":{"title":"mb-print-cloud API","version":env!("CARGO_PKG_VERSION")},
-        "paths":{
-            "/v1/tenants/{tenant}/printer-enrollments":{"post":{"security":[{"bearerAuth":[]}],"responses":{"201":{"description":"Enrollment code created"}}}},
-            "/v1/printer-enrollments/exchange":{"post":{"security":[],"responses":{"200":{"description":"Agent credential issued"},"410":{"description":"Code expired or consumed"}}}},
-            "/v1/tenants/{tenant}/printer-agents":{"get":{"security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Agents"}}}},
-            "/v1/tenants/{tenant}/printer-agents/{agent}/revoke":{"post":{"security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Agent revoked"}}}},
-            "/v1/tenants/{tenant}/printers":{"get":{"security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Published printers"}}}},
-            "/v1/tenants/{tenant}/print-jobs":{"post":{"security":[{"bearerAuth":[]}],"parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","maxLength":255}}],"responses":{"202":{"description":"Job stored"},"409":{"description":"Idempotency conflict"}}}},
-            "/v1/tenants/{tenant}/print-jobs/{job}":{"get":{"security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Job state"}}}},
-            "/v1/tenants/{tenant}/print-jobs/{job}/cancel":{"post":{"security":[{"bearerAuth":[]}],"responses":{"200":{"description":"Cancellation requested"}}}}
-        },
-        "components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}}}
-    }))
+#[derive(OpenApi)]
+#[openapi(info(title = "mb-print-cloud API", version = env!("CARGO_PKG_VERSION")), modifiers(&SecurityAddon))]
+struct ApiDoc;
+struct SecurityAddon;
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearerAuth",
+                SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            );
+        }
+    }
+}
+
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    business_router().into_openapi()
 }
 
 #[derive(Debug)]
@@ -85,6 +119,11 @@ pub enum ApiError {
     Gone,
     RateLimited,
     Internal(anyhow::Error),
+}
+#[derive(Serialize, ToSchema)]
+struct ErrorResponse {
+    error: &'static str,
+    message: Option<&'static str>,
 }
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
@@ -106,7 +145,14 @@ impl IntoResponse for ApiError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
             }
         };
-        (status, Json(json!({"error":code,"message":message}))).into_response()
+        (
+            status,
+            Json(ErrorResponse {
+                error: code,
+                message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -178,18 +224,29 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, ()> {
         .collect()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EnrollmentBody {
     display_name: String,
 }
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct EnrollmentCreated {
     agent_id: Uuid,
     code: String,
     expires_at: i64,
 }
+#[utoipa::path(
+    post, path = "/v1/tenants/{tenant}/printer-enrollments",
+    params(("tenant" = Uuid, Path)), request_body = EnrollmentBody,
+    responses(
+        (status = 201, body = EnrollmentCreated),
+        (status = 400, body = ErrorResponse), (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse), (status = 404, body = ErrorResponse),
+        (status = 500, body = ErrorResponse)
+    ),
+    security(("bearerAuth" = [])), tag = "printer-management"
+)]
 async fn create_enrollment(
     State(s): State<AppState>,
     Path(tenant): Path<Uuid>,
@@ -221,18 +278,26 @@ async fn create_enrollment(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct ExchangeBody {
     code: String,
 }
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct ExchangeResponse {
     agent_id: Uuid,
     token: String,
     agent_url: String,
 }
+#[utoipa::path(
+    post, path = "/v1/printer-enrollments/exchange", request_body = ExchangeBody,
+    responses(
+        (status = 200, body = ExchangeResponse), (status = 400, body = ErrorResponse),
+        (status = 410, body = ErrorResponse), (status = 429, body = ErrorResponse),
+        (status = 500, body = ErrorResponse)
+    ), tag = "printer-management"
+)]
 async fn exchange(
     State(s): State<AppState>,
     Json(body): Json<ExchangeBody>,
@@ -260,7 +325,7 @@ async fn exchange(
     }))
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct AgentView {
     id: String,
@@ -271,6 +336,15 @@ struct AgentView {
     last_connected_at: Option<i64>,
     last_heartbeat_at: Option<i64>,
 }
+#[utoipa::path(
+    get, path = "/v1/tenants/{tenant}/printer-agents",
+    params(("tenant" = Uuid, Path)),
+    responses(
+        (status = 200, body = Vec<AgentView>), (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse), (status = 404, body = ErrorResponse),
+        (status = 500, body = ErrorResponse)
+    ), security(("bearerAuth" = [])), tag = "printer-management"
+)]
 async fn list_agents(
     State(s): State<AppState>,
     Path(tenant): Path<Uuid>,
@@ -279,11 +353,27 @@ async fn list_agents(
     authorize(&s.config, &headers, tenant, "manage-printers")?;
     Ok(Json(sqlx::query_as("SELECT id,display_name,state,software_version,protocol_version,last_connected_at,last_heartbeat_at FROM printer_agents WHERE tenant_id=? ORDER BY created_at").bind(tenant.to_string()).fetch_all(&s.pool).await?))
 }
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RevokedAgent {
+    agent_id: Uuid,
+    state: &'static str,
+}
+
+#[utoipa::path(
+    post, path = "/v1/tenants/{tenant}/printer-agents/{agent}/revoke",
+    params(("tenant" = Uuid, Path), ("agent" = Uuid, Path)),
+    responses(
+        (status = 200, body = RevokedAgent), (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse), (status = 404, body = ErrorResponse),
+        (status = 500, body = ErrorResponse)
+    ), security(("bearerAuth" = [])), tag = "printer-management"
+)]
 async fn revoke_agent(
     State(s): State<AppState>,
     Path((tenant, agent)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<RevokedAgent>, ApiError> {
     authorize(&s.config, &headers, tenant, "manage-printers")?;
     let mut tx = s.pool.begin().await?;
     let changed=sqlx::query("UPDATE printer_agents SET state='revoked',revoked_at=? WHERE id=? AND tenant_id=? AND state<>'revoked'").bind(now()).bind(agent.to_string()).bind(tenant.to_string()).execute(&mut *tx).await?.rows_affected();
@@ -305,10 +395,13 @@ async fn revoke_agent(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Json(json!({"agentId":agent,"state":"revoked"})))
+    Ok(Json(RevokedAgent {
+        agent_id: agent,
+        state: "revoked",
+    }))
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct PrinterView {
     id: String,
@@ -319,6 +412,15 @@ struct PrinterView {
     online: bool,
     last_seen_at: Option<i64>,
 }
+#[utoipa::path(
+    get, path = "/v1/tenants/{tenant}/printers",
+    params(("tenant" = Uuid, Path)),
+    responses(
+        (status = 200, body = Vec<PrinterView>), (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse), (status = 404, body = ErrorResponse),
+        (status = 500, body = ErrorResponse)
+    ), security(("bearerAuth" = [])), tag = "printing"
+)]
 async fn list_printers(
     State(s): State<AppState>,
     Path(tenant): Path<Uuid>,
@@ -328,17 +430,24 @@ async fn list_printers(
     Ok(Json(sqlx::query_as("SELECT id,agent_id,display_name,model,enabled,online,last_seen_at FROM printers WHERE tenant_id=? ORDER BY display_name").bind(tenant.to_string()).fetch_all(&s.pool).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SubmitJob {
     printer_id: Uuid,
     #[serde(default = "source")]
     source: String,
-    request: Value,
+    request: ValidatedPrintRequest,
 }
-#[derive(Deserialize)]
+fn free_form_object() -> RefOr<Schema> {
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .additional_properties(Some(AdditionalProperties::FreeForm(true)))
+        .into()
+}
+#[derive(Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ValidatedPrintRequest {
+    #[schema(schema_with = free_form_object)]
     document: Value,
     model: String,
     #[serde(default)]
@@ -367,7 +476,7 @@ const fn payload_limit() -> usize {
 fn source() -> String {
     "api".into()
 }
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct JobView {
     id: String,
@@ -379,6 +488,8 @@ pub struct JobView {
     action: Option<String>,
     bytes_sent: i64,
     total_bytes: i64,
+    last_completed_action: i64,
+    action_count: i64,
     write_may_have_occurred: bool,
     cancellation_requested_at: Option<i64>,
     error_code: Option<String>,
@@ -387,7 +498,20 @@ pub struct JobView {
     started_at: Option<i64>,
     terminal_at: Option<i64>,
 }
-const JOB_BY_ID: &str = "SELECT id,printer_id,agent_id,state,terminal_outcome,progress,action,bytes_sent,total_bytes,write_may_have_occurred,cancellation_requested_at,error_code,created_at,delivered_at,started_at,terminal_at FROM print_jobs WHERE id=? AND tenant_id=?";
+const JOB_BY_ID: &str = "SELECT id,printer_id,agent_id,state,terminal_outcome,progress,action,bytes_sent,total_bytes,last_completed_action,action_count,write_may_have_occurred,cancellation_requested_at,error_code,created_at,delivered_at,started_at,terminal_at FROM print_jobs WHERE id=? AND tenant_id=?";
+#[utoipa::path(
+    post, path = "/v1/tenants/{tenant}/print-jobs",
+    params(
+        ("tenant" = Uuid, Path),
+        ("Idempotency-Key" = String, Header, description = "Deduplicates an exact submission", max_length = 255)
+    ), request_body = SubmitJob,
+    responses(
+        (status = 202, body = JobView), (status = 400, body = ErrorResponse),
+        (status = 401, body = ErrorResponse), (status = 403, body = ErrorResponse),
+        (status = 404, body = ErrorResponse), (status = 409, body = ErrorResponse),
+        (status = 413, body = ErrorResponse), (status = 500, body = ErrorResponse)
+    ), security(("bearerAuth" = [])), tag = "printing"
+)]
 async fn create_job(
     State(s): State<AppState>,
     Path(tenant): Path<Uuid>,
@@ -411,28 +535,27 @@ async fn create_job(
     if request.len() > s.config.max_request_bytes {
         return Err(ApiError::Bad("request is too large"));
     }
-    let validated: ValidatedPrintRequest =
-        serde_json::from_slice(&request).map_err(|_| ApiError::Bad("request is invalid"))?;
-    if validated.model.is_empty()
-        || validated.document.get("version").and_then(Value::as_u64) != Some(4)
-        || !validated
+    if body.request.model.is_empty()
+        || body.request.document.get("version").and_then(Value::as_u64) != Some(4)
+        || !body
+            .request
             .document
             .get("media")
             .is_some_and(Value::is_object)
-        || !matches!(validated.rotation, 0 | 90 | 180 | 270)
-        || !(1..=8).contains(&validated.density)
-        || validated.copies == 0
-        || validated.copies > 100
-        || validated.payload_limit == 0
-        || validated.payload_limit > s.config.max_request_bytes
-        || validated.dpi == Some(0)
+        || !matches!(body.request.rotation, 0 | 90 | 180 | 270)
+        || !(1..=8).contains(&body.request.density)
+        || body.request.copies == 0
+        || body.request.copies > 100
+        || body.request.payload_limit == 0
+        || body.request.payload_limit > s.config.max_request_bytes
+        || body.request.dpi == Some(0)
     {
         return Err(ApiError::Bad("print request is invalid"));
     }
     let digest = hash(&request);
     let semantic = hash(
         &serde_json::to_vec(
-            &json!({"printerId":body.printer_id,"source":body.source,"request":body.request}),
+            &json!({"printerId":body.printer_id,"source":&body.source,"request":&body.request}),
         )
         .unwrap(),
     );
@@ -452,7 +575,7 @@ async fn create_job(
     if !printer.1 {
         return Err(ApiError::Conflict("printer is disabled"));
     }
-    if validated.model != printer.2 {
+    if body.request.model != printer.2 {
         return Err(ApiError::Bad("request model does not match printer"));
     }
     let id = Uuid::new_v4();
@@ -467,6 +590,15 @@ async fn create_job(
     tx.commit().await?;
     Ok((StatusCode::ACCEPTED, Json(row)))
 }
+#[utoipa::path(
+    get, path = "/v1/tenants/{tenant}/print-jobs/{job}",
+    params(("tenant" = Uuid, Path), ("job" = Uuid, Path)),
+    responses(
+        (status = 200, body = JobView), (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse), (status = 404, body = ErrorResponse),
+        (status = 500, body = ErrorResponse)
+    ), security(("bearerAuth" = [])), tag = "printing"
+)]
 async fn get_job(
     State(s): State<AppState>,
     Path((tenant, job)): Path<(Uuid, Uuid)>,
@@ -482,6 +614,15 @@ async fn get_job(
             .ok_or(ApiError::NotFound)?,
     ))
 }
+#[utoipa::path(
+    post, path = "/v1/tenants/{tenant}/print-jobs/{job}/cancel",
+    params(("tenant" = Uuid, Path), ("job" = Uuid, Path)),
+    responses(
+        (status = 200, body = JobView), (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse), (status = 404, body = ErrorResponse),
+        (status = 409, body = ErrorResponse), (status = 500, body = ErrorResponse)
+    ), security(("bearerAuth" = [])), tag = "printing"
+)]
 async fn cancel_job(
     State(s): State<AppState>,
     Path((tenant, job)): Path<(Uuid, Uuid)>,
@@ -596,5 +737,80 @@ mod tests {
         assert_eq!(json(replay).await["id"], first_id);
         let conflict = app.oneshot(submit(2)).await.unwrap();
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn generated_openapi_covers_every_business_route_and_typed_job_progress() {
+        let document = serde_json::to_value(openapi_document()).unwrap();
+        let paths = document["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 8);
+        for required in [
+            "/v1/printer-enrollments/exchange",
+            "/v1/tenants/{tenant}/printer-enrollments",
+            "/v1/tenants/{tenant}/printer-agents",
+            "/v1/tenants/{tenant}/printer-agents/{agent}/revoke",
+            "/v1/tenants/{tenant}/printers",
+            "/v1/tenants/{tenant}/print-jobs",
+            "/v1/tenants/{tenant}/print-jobs/{job}",
+            "/v1/tenants/{tenant}/print-jobs/{job}/cancel",
+        ] {
+            assert!(paths.contains_key(required), "missing {required}");
+        }
+        assert_eq!(
+            document["components"]["schemas"]["JobView"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|field| matches!(*field, "lastCompletedAction" | "actionCount"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            document["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_only_configured_browser_origin_and_headers() {
+        let (_directory, mut state, _token) = fixture().await;
+        let mut config = (*state.config).clone();
+        config.cors_origins = vec!["https://labels.example.test".into()];
+        state.config = Arc::new(config);
+        let app = router(state);
+        let preflight = |origin: &str| {
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/v1/tenants/00000000-0000-0000-0000-000000000000/print-jobs")
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .header(
+                    "access-control-request-headers",
+                    "authorization,content-type,idempotency-key",
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+        let allowed = app
+            .clone()
+            .oneshot(preflight("https://labels.example.test"))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed.headers()["access-control-allow-origin"],
+            "https://labels.example.test"
+        );
+        let denied = app
+            .oneshot(preflight("https://evil.example.test"))
+            .await
+            .unwrap();
+        assert!(
+            denied
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
     }
 }

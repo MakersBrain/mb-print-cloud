@@ -20,3 +20,7 @@ credential. Agents authenticate with credentials issued by the enrollment API.
 The OpenAPI 3.1 document is served at `/openapi.json`. See
 [`docs/operations.md`](docs/operations.md) for Caddy, enrollment, revocation,
 backup, and ambiguous-output procedures.
+
+The contract is generated from the Axum handlers and Rust wire types with
+`utoipa`/`utoipa-axum`; it is not hand-maintained JSON. Export the exact
+contract for a client build with `mb-print-cloud openapi`.
