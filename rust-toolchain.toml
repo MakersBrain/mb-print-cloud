@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so every machine and CI job compiles with the same rustc. The shared
+# sccache on R2 keys on the compiler version, so an unpinned toolchain means
+# each machine fills its own cache instead of sharing one.
+channel = "1.98.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
