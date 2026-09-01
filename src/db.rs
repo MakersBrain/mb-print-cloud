@@ -36,7 +36,7 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
         .fetch_one(pool)
         .await?;
-    if version > 2 {
+    if version > 3 {
         anyhow::bail!("database schema is newer than this mb-print-cloud binary");
     }
     if version == 0 {
@@ -60,6 +60,21 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(&mut *transaction)
             .await?;
         sqlx::query("PRAGMA user_version=2")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+    }
+    if version < 3 {
+        let mut transaction = pool.begin().await?;
+        for statement in [
+            "ALTER TABLE print_jobs ADD COLUMN batch_item INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE print_jobs ADD COLUMN batch_items INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE print_jobs ADD COLUMN batch_copy INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE print_jobs ADD COLUMN batch_copies INTEGER NOT NULL DEFAULT 1",
+        ] {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+        sqlx::query("PRAGMA user_version=3")
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
@@ -122,7 +137,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            2
+            3
         );
         pool.close().await;
         let reopened = super::open(&path).await.unwrap();
