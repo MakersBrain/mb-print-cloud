@@ -28,7 +28,7 @@ use utoipa::{
     Modify, OpenApi, ToSchema,
     openapi::{
         RefOr, Schema,
-        schema::{AdditionalProperties, ObjectBuilder, Type},
+        schema::{AdditionalProperties, ArrayBuilder, ObjectBuilder, Type},
         security::{Http, HttpAuthScheme, SecurityScheme},
     },
 };
@@ -445,11 +445,21 @@ fn free_form_object() -> RefOr<Schema> {
         .additional_properties(Some(AdditionalProperties::FreeForm(true)))
         .into()
 }
+fn free_form_array() -> RefOr<Schema> {
+    ArrayBuilder::new()
+        .items(free_form_object())
+        .min_items(Some(1))
+        .into()
+}
 #[derive(Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ValidatedPrintRequest {
     #[schema(schema_with = free_form_object)]
-    document: Value,
+    #[serde(default)]
+    document: Option<Value>,
+    #[schema(schema_with = free_form_array)]
+    #[serde(default)]
+    documents: Vec<Value>,
     model: String,
     #[serde(default)]
     dpi: Option<u16>,
@@ -464,6 +474,25 @@ struct ValidatedPrintRequest {
     copies: u16,
     #[serde(default = "payload_limit")]
     payload_limit: usize,
+    #[serde(default)]
+    continuous: Option<ContinuousPrintOptions>,
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContinuousPrintOptions {
+    cut_mode: ContinuousCutMode,
+    extra_feed_before_mm: f64,
+    extra_feed_after_mm: f64,
+    chain_copies: bool,
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+enum ContinuousCutMode {
+    AfterEach,
+    AfterJob,
+    None,
 }
 const fn density() -> u8 {
     6
@@ -491,6 +520,10 @@ pub struct JobView {
     total_bytes: i64,
     last_completed_action: i64,
     action_count: i64,
+    item: i64,
+    items: i64,
+    copy: i64,
+    copies: i64,
     write_may_have_occurred: bool,
     cancellation_requested_at: Option<i64>,
     error_code: Option<String>,
@@ -499,7 +532,7 @@ pub struct JobView {
     started_at: Option<i64>,
     terminal_at: Option<i64>,
 }
-const JOB_BY_ID: &str = "SELECT id,printer_id,agent_id,state,terminal_outcome,progress,action,bytes_sent,total_bytes,last_completed_action,action_count,write_may_have_occurred,cancellation_requested_at,error_code,created_at,delivered_at,started_at,terminal_at FROM print_jobs WHERE id=? AND tenant_id=?";
+const JOB_BY_ID: &str = "SELECT id,printer_id,agent_id,state,terminal_outcome,progress,action,bytes_sent,total_bytes,last_completed_action,action_count,batch_item AS item,batch_items AS items,batch_copy AS copy,batch_copies AS copies,write_may_have_occurred,cancellation_requested_at,error_code,created_at,delivered_at,started_at,terminal_at FROM print_jobs WHERE id=? AND tenant_id=?";
 #[utoipa::path(
     post, path = "/v1/tenants/{tenant}/print-jobs",
     params(
@@ -536,13 +569,20 @@ async fn create_job(
     if request.len() > s.config.max_request_bytes {
         return Err(ApiError::Bad("request is too large"));
     }
+    let documents = match (&body.request.document, body.request.documents.is_empty()) {
+        (Some(document), true) => vec![document],
+        (None, false) => body.request.documents.iter().collect(),
+        _ => {
+            return Err(ApiError::Bad(
+                "provide exactly one of document or documents",
+            ));
+        }
+    };
     if body.request.model.is_empty()
-        || body.request.document.get("version").and_then(Value::as_u64) != Some(4)
-        || !body
-            .request
-            .document
-            .get("media")
-            .is_some_and(Value::is_object)
+        || documents.iter().any(|document| {
+            document.get("version").and_then(Value::as_u64) != Some(4)
+                || !document.get("media").is_some_and(Value::is_object)
+        })
         || !matches!(body.request.rotation, 0 | 90 | 180 | 270)
         || !(1..=8).contains(&body.request.density)
         || body.request.copies == 0
@@ -550,6 +590,17 @@ async fn create_job(
         || body.request.payload_limit == 0
         || body.request.payload_limit > s.config.max_request_bytes
         || body.request.dpi == Some(0)
+        || body.request.continuous.as_ref().is_some_and(|continuous| {
+            documents.iter().any(|document| {
+                document
+                    .pointer("/media/continuous")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+            }) || !continuous.extra_feed_before_mm.is_finite()
+                || !continuous.extra_feed_after_mm.is_finite()
+                || continuous.extra_feed_before_mm < 0.0
+                || continuous.extra_feed_after_mm < 0.0
+        })
     {
         return Err(ApiError::Bad("print request is invalid"));
     }
@@ -766,6 +817,64 @@ mod tests {
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
     }
 
+    #[tokio::test]
+    async fn continuous_batch_is_persisted_and_participates_in_idempotency() {
+        let (_directory, state, token) = fixture().await;
+        let tenant = state.config.tenant.id;
+        let agent = Uuid::new_v4();
+        let printer = Uuid::new_v4();
+        let timestamp = now();
+        sqlx::query("INSERT INTO printer_agents(id,tenant_id,display_name,state,enrollment_consumed_at,created_by,created_at) VALUES(?,?,?,'active',?,?,?)")
+            .bind(agent.to_string()).bind(tenant.to_string()).bind("agent").bind(timestamp).bind("test").bind(timestamp).execute(&state.pool).await.unwrap();
+        sqlx::query("INSERT INTO printers(id,tenant_id,agent_id,display_name,model,enabled,online,created_at,updated_at) VALUES(?,?,?,?,?,1,0,?,?)")
+            .bind(printer.to_string()).bind(tenant.to_string()).bind(agent.to_string()).bind("roll").bind("ql-1110nwb").bind(timestamp).bind(timestamp).execute(&state.pool).await.unwrap();
+        let app = router(state.clone());
+        let submit = |cut_mode: &str| {
+            Request::post(format!("/v1/tenants/{tenant}/print-jobs"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("idempotency-key", "continuous-order-42")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "printerId": printer,
+                        "request": {
+                            "documents": [
+                                {"version": 4, "media": {"continuous": true}},
+                                {"version": 4, "media": {"continuous": true}}
+                            ],
+                            "model": "ql-1110nwb",
+                            "continuous": {
+                                "cutMode": cut_mode,
+                                "extraFeedBeforeMm": 0.0,
+                                "extraFeedAfterMm": 0.0,
+                                "chainCopies": false
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(submit("after-each")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_id = json(first).await["id"].as_str().unwrap().to_owned();
+        let replay = app.clone().oneshot(submit("after-each")).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let conflict = app.oneshot(submit("none")).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let request: Vec<u8> = sqlx::query_scalar("SELECT request FROM print_jobs WHERE id=?")
+            .bind(first_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let request: Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(request["continuous"]["cutMode"], "after-each");
+        assert_eq!(request["continuous"]["chainCopies"], false);
+        assert_eq!(request["documents"].as_array().unwrap().len(), 2);
+    }
+
     #[test]
     fn generated_openapi_covers_every_business_route_and_typed_job_progress() {
         let document = serde_json::to_value(openapi_document()).unwrap();
@@ -796,6 +905,13 @@ mod tests {
         assert_eq!(
             document["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"
+        );
+        let continuous_schema =
+            &document["components"]["schemas"]["ValidatedPrintRequest"]["properties"]["continuous"];
+        assert!(
+            serde_json::to_string(continuous_schema)
+                .unwrap()
+                .contains("#/components/schemas/ContinuousPrintOptions")
         );
     }
 

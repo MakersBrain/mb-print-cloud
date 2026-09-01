@@ -274,8 +274,8 @@ async fn update_job(
         "running"
     };
     let updated_at = now();
-    let changed = sqlx::query("UPDATE print_jobs SET state=?,terminal_outcome=CASE WHEN ? THEN ? ELSE terminal_outcome END,action=?,last_completed_action=MAX(last_completed_action,?),action_count=MAX(action_count,?),bytes_sent=MAX(bytes_sent,?),total_bytes=MAX(total_bytes,?),write_may_have_occurred=(write_may_have_occurred OR ?),error_code=NULLIF(?,''),started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,?) ELSE terminal_at END WHERE id=? AND agent_id=? AND terminal_at IS NULL")
-        .bind(cloud_state).bind(terminal).bind(if terminal{Some(job.state.as_str())}else{None}).bind(&job.state).bind(job.last_completed_action).bind(job.action_count as i64).bind(job.bytes_sent as i64).bind(job.total_bytes as i64).bind(job.potentially_accepted_write).bind(&job.error_code).bind(cloud_state).bind(updated_at).bind(terminal).bind(updated_at).bind(&job.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?.rows_affected();
+    let changed = sqlx::query("UPDATE print_jobs SET state=?,terminal_outcome=CASE WHEN ? THEN ? ELSE terminal_outcome END,action=?,last_completed_action=MAX(last_completed_action,?),action_count=MAX(action_count,?),batch_item=?,batch_items=MAX(batch_items,?),batch_copy=?,batch_copies=MAX(batch_copies,?),bytes_sent=MAX(bytes_sent,?),total_bytes=MAX(total_bytes,?),write_may_have_occurred=(write_may_have_occurred OR ?),error_code=NULLIF(?,''),started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,?) ELSE terminal_at END WHERE id=? AND agent_id=? AND terminal_at IS NULL")
+        .bind(cloud_state).bind(terminal).bind(if terminal{Some(job.state.as_str())}else{None}).bind(&job.state).bind(job.last_completed_action).bind(job.action_count as i64).bind(job.item as i64).bind(job.items as i64).bind(job.copy as i64).bind(job.copies as i64).bind(job.bytes_sent as i64).bind(job.total_bytes as i64).bind(job.potentially_accepted_write).bind(&job.error_code).bind(cloud_state).bind(updated_at).bind(terminal).bind(updated_at).bind(&job.job_id).bind(agent.to_string()).execute(&state.pool).await.map_err(internal)?.rows_affected();
     if changed == 1
         && let Ok(job_id) = Uuid::parse_str(&job.job_id)
     {
@@ -366,6 +366,10 @@ mod tests {
                 potentially_accepted_write: true,
                 error_code: String::new(),
                 action_count: 12,
+                item: 1,
+                items: 3,
+                copy: 0,
+                copies: 2,
             },
             false,
         )
@@ -373,5 +377,13 @@ mod tests {
         .unwrap();
         let row = sqlx::query_as::<_, (i64, i64, i64, i64)>("SELECT last_completed_action,action_count,bytes_sent,total_bytes FROM print_jobs WHERE id=?").bind(job_id.to_string()).fetch_one(&pool).await.unwrap();
         assert_eq!(row, (7, 12, 128, 256));
+        let batch = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT batch_item,batch_items,batch_copy,batch_copies FROM print_jobs WHERE id=?",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(batch, (1, 3, 0, 2));
     }
 }
